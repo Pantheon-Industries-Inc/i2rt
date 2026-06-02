@@ -381,9 +381,7 @@ class LinearRailController:
                     last_velocity_set_time = current_time
 
                 with self._lock:
-                    triggered = (
-                        self.upper_limit_triggered if direction == "up" else self.lower_limit_triggered
-                    )
+                    triggered = self.upper_limit_triggered if direction == "up" else self.lower_limit_triggered
                 if triggered:
                     self.single_motor_control_interface.set_velocity(0.0)
                     elapsed = current_time - start_time
@@ -394,9 +392,7 @@ class LinearRailController:
 
             # Timeout
             self.single_motor_control_interface.set_velocity(0.0)
-            raise RuntimeError(
-                f"Homing timed out after {self.homing_timeout}s moving {direction}"
-            )
+            raise RuntimeError(f"Homing timed out after {self.homing_timeout}s moving {direction}")
         finally:
             with self._lock:
                 self._homing_event.clear()
