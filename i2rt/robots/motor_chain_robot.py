@@ -85,6 +85,8 @@ class MotorChainRobot(Robot):
         test_duration: float = 2.0,  # max test duration for each direction (s)
         position_threshold: float = 0.01,  # minimum position change to consider motor still moving (rad)
         check_interval: float = 0.05,  # time interval between checks (s)
+        gripper_close_margin: float = 0.0,  # push detected 'closed' deeper (rad) so the jaw fully seats
+
         pinned_cpu: int | None = None,
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
@@ -126,6 +128,37 @@ class MotorChainRobot(Robot):
                 # Use the provided gripper_limits
                 logger = logging.getLogger(__name__)
                 logger.info(f"Using provided gripper limits: {gripper_limits}")
+
+            # Push the 'closed' limit deeper by a fixed margin so the jaw fully
+            # seats. detect_gripper_limits stops at a gentle test torque, which can
+            # be short of the true mechanical close (the left YAM gripper stalls
+            # ~0.4 rad early). The GripperForceLimiter caps force at the hard stop,
+            # so commanding slightly past it is safe. Applied in the close direction
+            # (sign of closed-open) so it is polarity-agnostic. This lets BOTH arms
+            # run pure auto-calibration (immune to multi-turn zero shifts on
+            # power-cycle) instead of pinned limits that silently go stale.
+            if gripper_close_margin and gripper_limits is not None:
+                _closed, _opened = float(gripper_limits[0]), float(gripper_limits[1])
+                gripper_limits = np.array(
+                    [_closed + np.sign(_closed - _opened) * float(gripper_close_margin), _opened]
+                )
+                logging.getLogger(__name__).info(
+                    f"Applied gripper_close_margin={gripper_close_margin}: limits -> {gripper_limits}"
+                )
+
+            # Env-gated dump of the (detected or provided) gripper limits so the
+            # values can be pinned into the robot config for deterministic boots.
+            if os.environ.get("GRIP_LIMITS_DUMP") and gripper_limits is not None:
+                try:
+                    tag = (
+                        getattr(motor_chain, "channel", None)
+                        or getattr(motor_chain, "motor_chain_name", None)
+                        or f"pid{os.getpid()}"
+                    )
+                    with open(f"/tmp/gripper_limits_{tag}.txt", "w") as _f:
+                        _f.write(f"{float(gripper_limits[0])},{float(gripper_limits[1])}\n")
+                except Exception:
+                    pass
 
         self._last_gripper_command_qpos = 1  # initialize as fully open
         assert clip_motor_torque >= 0.0
@@ -217,6 +250,40 @@ class MotorChainRobot(Robot):
 
     def __repr__(self) -> str:
         return f"MotorChainRobot(motor_chain={self.motor_chain})"
+
+    def _grip_trace(self, gs: dict, pre_target: float, post_cmd: float) -> None:
+        """Env-gated follower gripper telemetry (set GRIP_FOLLOWER_TRACE=1).
+
+        Writes one CSV row per control tick so we can see exactly when the
+        GripperForceLimiter flips to 'clogged' during a slow close and how far
+        it backs the command off (the source of the grating limit-cycle).
+        """
+        import os as _os
+        if not _os.environ.get("GRIP_FOLLOWER_TRACE"):
+            return
+        try:
+            if not hasattr(self, "_gtf"):
+                name = getattr(self.motor_chain, "name", None) or getattr(
+                    self.motor_chain, "motor_chain_name", None
+                ) or f"pid{_os.getpid()}"
+                self._gtf = open(f"/tmp/gfollow_{name}.csv", "w")
+                self._gtf.write(
+                    "t,target_qpos,current_qpos,qvel,eff,clogged,pre_target,post_cmd,adj\n"
+                )
+            clog = int(getattr(self._gripper_force_limiter, "_is_clogged", False))
+            self._gtf.write(
+                f"{time.time():.4f},{gs['target_qpos']:.5f},{gs['current_qpos']:.5f},"
+                f"{gs['current_qvel']:.5f},{gs['current_eff']:.5f},{clog},"
+                f"{pre_target:.5f},{post_cmd:.5f},{post_cmd - pre_target:.5f}\n"
+            )
+            # Flushing every tick (~300 Hz) issues ~300 fsyncs/s and throttles the
+            # control loop itself, so buffer and flush periodically instead — the
+            # trace must observe the loop, not slow it down.
+            self._gtf_n = getattr(self, "_gtf_n", 0) + 1
+            if self._gtf_n % 250 == 0:
+                self._gtf.flush()
+        except Exception:
+            pass
 
     def _check_current_qpos_in_joint_limits(self, buffer_rad: float = 0.1) -> None:
         """Check if the self._joint_state is in the joint limits.
@@ -335,7 +402,9 @@ class MotorChainRobot(Robot):
                         "last_command_qpos": self._last_gripper_command_qpos,
                     }
 
+                    _pre = float(gripper_state["target_qpos"])
                     joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
+                    self._grip_trace(gripper_state, _pre, float(joint_commands.pos[self._gripper_index]))
 
                 # add final clip so the gripper won't be over-adjusted
                 joint_commands.pos[self._gripper_index] = np.clip(

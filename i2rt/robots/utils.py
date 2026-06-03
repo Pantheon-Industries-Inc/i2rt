@@ -290,7 +290,15 @@ class GripperType(enum.Enum):
         elif self == GripperType.LINEAR_4310:
             return (
                 0.5,
-                0.3,
+                # clog_speed_threshold: only treat the gripper as stalled when it
+                # is essentially stationary (<0.05 rad/s). The old 0.3 rad/s value
+                # misclassified deliberate SLOW closes (which run well under
+                # 0.3 rad/s) as stalls, so the force limiter would engage during
+                # travel and back-off/re-push in an audible limit-cycle ("grating"
+                # close). Telemetry showed every genuine clog occurs at |vel|~0
+                # (p90 < 0.02 rad/s), so 0.05 preserves stop/object force limiting
+                # and "let go on open" while eliminating travel grating.
+                0.05,
                 1.0,
                 partial(
                     linear_gripper_force_torque_map,
