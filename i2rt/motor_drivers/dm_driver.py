@@ -378,6 +378,8 @@ class DMChainCanInterface(MotorChain):
         control_mode: ControlMode = ControlMode.MIT,
         get_same_bus_device_driver: Optional[Callable] = None,
         use_buffered_reader: bool = False,  # buffered reader is not very stable, the latest encoder fix allows us to use the non-buffered reader
+        kp: Optional[np.ndarray] = None,  # per-motor position gain used to hold pose on energize
+        kd: Optional[np.ndarray] = None,  # per-motor damping gain used to hold pose on energize
     ):
         assert not use_buffered_reader, (
             "buffered reader is not very stable, the latest encoder fix allows us to use the non-buffered reader"
@@ -386,9 +388,16 @@ class DMChainCanInterface(MotorChain):
         assert len(motor_list) == len(motor_offset) == len(motor_direction), (
             f"len{len(motor_list)}, len{len(motor_offset)}, len{len(motor_direction)}"
         )
+        assert (kp is None) == (kd is None), "kp and kd must be provided together"
+        if kp is not None:
+            assert len(kp) == len(kd) == len(motor_list), (
+                f"kp/kd must be one per motor, got len(kp)={len(kp)}, len(kd)={len(kd)}, len(motor_list)={len(motor_list)}"
+            )
         self.motor_list = motor_list
         self.motor_offset = np.array(motor_offset)
         self.motor_direction = np.array(motor_direction)
+        self.kp = np.array(kp, dtype=float) if kp is not None else None
+        self.kd = np.array(kd, dtype=float) if kd is not None else None
         self.channel = channel
         logging.info(f"Channel: {channel}, Bitrate: {bitrate}")
         if "can" in channel:
@@ -420,12 +429,15 @@ class DMChainCanInterface(MotorChain):
 
         self.absolute_positions = None
         self._motor_on()
-        starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
+        starting_command = self._build_starting_command()
         logging.info(f"Initializing motorchain with starting command: {starting_command}")
         self.commands = starting_command
         self.command_lock = threading.Lock()
+        if self.kp is not None:
+            # _motor_on() has already energized the motors. Push the hold onto the bus
+            # now rather than waiting for the control loop's first tick -- and when
+            # start_thread=False there is no control loop to wait for at all.
+            self._set_commands(starting_command)
 
         self.start_thread_flag = start_thread
         if start_thread:
@@ -476,6 +488,33 @@ class DMChainCanInterface(MotorChain):
 
     def _joint_position_sim_to_real_idx(self, joint_position_sim: float, idx: int) -> float:
         return joint_position_sim * self.motor_direction[idx] + self.motor_offset[idx]
+
+    def _build_starting_command(self) -> List[MotorCmd]:
+        """Build the command the chain holds between energizing and the caller taking over.
+
+        _motor_on() powers every motor but the command it is left holding has
+        kp=kd=0, so nothing resists gravity and the arm falls from the moment it
+        energizes until the caller issues its first real command. Seeding the
+        position loop from the measured position with the configured gains makes
+        the arm hold where it already is instead of holding nothing.
+
+        Without configured gains we cannot do this -- a guessed kp is its own
+        hazard -- so fall back to the previous torque-only command.
+        """
+        if self.kp is None:
+            return [MotorCmd(torque=motor_state.torque) for motor_state in self.state]
+
+        return [
+            MotorCmd(
+                pos=self._joint_position_real_to_sim_idx(self.absolute_positions[idx], idx),
+                # _set_commands re-applies motor_direction, so pre-divide (== multiply,
+                # direction is +/-1) to feed back the torque the motor actually reports.
+                torque=motor_state.torque * self.motor_direction[idx],
+                kp=self.kp[idx],
+                kd=self.kd[idx],
+            )
+            for idx, motor_state in enumerate(self.state)
+        ]
 
     def _motor_on(self) -> None:
         motor_feedback = []

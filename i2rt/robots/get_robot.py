@@ -179,6 +179,8 @@ def get_yam_robot(
         motor_chain_name="yam_real",
         receive_mode=ReceiveMode.p16,
         start_thread=False,
+        kp=kp,
+        kd=kd,
     )
     motor_states = motor_chain.read_states()
     print(f"motor_states: {motor_states}")
@@ -206,6 +208,8 @@ def get_yam_robot(
         receive_mode=ReceiveMode.p16,
         get_same_bus_device_driver=get_encoder_chain if with_teaching_handle else None,
         use_buffered_reader=False,
+        kp=kp,
+        kd=kd,
     )
     logging.info(f"YAM initial motor_states: {motor_chain.read_states()}")
 

@@ -562,6 +562,23 @@ def detect_gripper_limits(
     positions.append(initial_pos)
     logger.info(f"Gripper calibration starting from position: {initial_pos:.4f}")
 
+    # Hold the arm joints where they are while we probe the gripper. set_commands
+    # defaults kp/kd to zero for every motor, so without this the whole arm is
+    # commanded to hold nothing for up to max_duration per direction and falls
+    # under gravity. The gripper's own gains stay at zero -- the probe is
+    # torque-driven and a position hold would fight it.
+    hold_pos = None
+    hold_kp = None
+    hold_kd = None
+    if getattr(motor_chain, "kp", None) is not None:
+        hold_pos = np.array([state.pos for state in initial_states])
+        hold_kp = np.array(motor_chain.kp, dtype=float)
+        hold_kd = np.array(motor_chain.kd, dtype=float)
+        hold_kp[gripper_index] = 0.0
+        hold_kd[gripper_index] = 0.0
+    else:
+        logger.warning("Motor chain has no configured gains; arm joints stay unheld during gripper calibration.")
+
     # Test both directions
     for direction in [1, -1]:
         logger.info(f"Testing gripper direction: {direction}")
@@ -573,7 +590,7 @@ def detect_gripper_limits(
         position_stable_count = 0
 
         while time.time() - start_time < max_duration:
-            motor_chain.set_commands(torques=test_torques)
+            motor_chain.set_commands(torques=test_torques, pos=hold_pos, kp=hold_kp, kd=hold_kd)
             time.sleep(check_interval)
 
             states = motor_chain.read_states()
