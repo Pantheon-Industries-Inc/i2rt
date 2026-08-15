@@ -98,7 +98,8 @@ class MotorChainRobot(Robot):
         gripper_torque_mode: bool = False,  # drive the gripper with torque cmds via a software position loop instead of onboard MIT position control. REQUIRED when the gripper's absolute position can exceed the ±12.5 rad p16 command encoding (long-stroke worm gear + multi-turn zero drift): position cmds get silently clamped at ±12.5, torque cmds don't.
         gripper_torque_mode_cap: float = 2.0,  # torque clip (Nm) for the software gripper loop
         gripper_rezero_midstroke: bool = False,  # boot: stall-probe closed, drive open span/2, save that as the motor's zero -> limits [+span/2, -span/2] always fit the ±12.5 p16 encoding regardless of multi-turn drift. Plain position control thereafter.
-        clog_speed_threshold_scale: Optional[float] = None,  # ADDED 2026-08-15: per-rig multiplier on the soft-latch speed gate -- see GripperForceLimiter. Worm-gear rigs need >1 or the latch never fires on compliant objects.
+        clog_speed_threshold_scale: Optional[float] = None,
+        hard_latch_effort_multiplier: Optional[float] = None,  # per-rig hard-latch trip point as a multiple of the scaled soft threshold (default 2.5) -- see GripperForceLimiter  # ADDED 2026-08-15: per-rig multiplier on the soft-latch speed gate -- see GripperForceLimiter. Worm-gear rigs need >1 or the latch never fires on compliant objects.
         clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier on GripperType's shared clog_force_threshold/hard_latch trigger -- different physical grippers of the same nominal type can have different baseline mechanical friction, so free-space closing motion alone can cross the shared class-level threshold on one rig before it would on another (false "clogged" latch with nothing actually gripped, closing stops short). None = use the class default unscaled.
 
         pinned_cpu: int | None = None,
@@ -216,6 +217,7 @@ class MotorChainRobot(Robot):
                 average_torque_window=gripper_effort_window,
                 clog_force_threshold_scale=clog_force_threshold_scale,
                 clog_speed_threshold_scale=clog_speed_threshold_scale,
+                hard_latch_effort_multiplier=hard_latch_effort_multiplier,
                 name=self._chain_name,
             )  # force in newton
             self._limit_gripper_force = limit_gripper_force

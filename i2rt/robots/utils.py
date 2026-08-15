@@ -479,7 +479,8 @@ class GripperForceLimiter:
         average_torque_window: float = 0.1,  # in seconds
         debug: bool = False,
         clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier -- see MotorChainRobot's clog_force_threshold_scale docstring.
-        clog_speed_threshold_scale: Optional[float] = None,  # ADDED 2026-08-15: per-rig multiplier on the soft-latch SPEED gate. The class default (0.08 rad/s for LINEAR_4310) is linear-drive tuning; a worm-gear jaw crushing a compliant object still creeps at 0.1-0.3 rad/s, so the soft latch never fires and force winds to the track-torque cap. Scale up so the latch can fire while the jaw is still creeping under load; keep the scaled value BELOW free-travel speed (gem10 right: ~0.55-0.65 rad/s) or it will false-latch mid-close.
+        clog_speed_threshold_scale: Optional[float] = None,
+        hard_latch_effort_multiplier: Optional[float] = None,  # ADDED 2026-08-15: override the hard-latch trip point as a multiple of the (scaled) soft threshold. Default 2.5.  # ADDED 2026-08-15: per-rig multiplier on the soft-latch SPEED gate. The class default (0.08 rad/s for LINEAR_4310) is linear-drive tuning; a worm-gear jaw crushing a compliant object still creeps at 0.1-0.3 rad/s, so the soft latch never fires and force winds to the track-torque cap. Scale up so the latch can fire while the jaw is still creeping under load; keep the scaled value BELOW free-travel speed (gem10 right: ~0.55-0.65 rad/s) or it will false-latch mid-close.
         name: Optional[str] = None,  # ADDED 2026-07-29: motor_chain_name (e.g. "yam_left"), used only to label clog log lines.
     ):
         self.max_force = max_force
@@ -511,7 +512,7 @@ class GripperForceLimiter:
         # "operator wants it open."
         self._unlatch_open_deadband = 0.02
         # FIXED 2026-07-19: hard-impact override multiplier -- see compute_target_gripper_torque.
-        self.hard_latch_effort_multiplier = 2.5  # REVERTED 2026-07-22 (was briefly 1.5) -- gripper_max_track_torque (per-arm YAML, always-on every tick, independent of clog detection) is now the real safety net and already confirmed catching fast pulls without breaking anything. The lowered multiplier here was over-sensitive and made LEFT false-latch (freeze, wont close) on an ordinary fast pull. Back to 2.5.
+        self.hard_latch_effort_multiplier = float(hard_latch_effort_multiplier) if hard_latch_effort_multiplier is not None else 2.5  # REVERTED 2026-07-22 (was briefly 1.5) -- gripper_max_track_torque (per-arm YAML, always-on every tick, independent of clog detection) is now the real safety net and already confirmed catching fast pulls without breaking anything. The lowered multiplier here was over-sensitive and made LEFT false-latch (freeze, wont close) on an ordinary fast pull. Back to 2.5.
         # RETUNED 2026-07-22 (round 2, per direct request): the hard-impact
         # override briefly used raw instantaneous current_eff (single tick) to
         # react faster to fast trigger pulls -- but a single tick is noisy
