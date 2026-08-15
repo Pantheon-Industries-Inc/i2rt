@@ -554,6 +554,18 @@ class GripperForceLimiter:
             hard_latch_effort = np.abs(gripper_state["current_eff"])
 
         self._just_latched = False
+        # ADDED 2026-08-15: direction gate. Both latch paths below exist to stop the
+        # jaw CRUSHING something on the way closed; neither should ever fire while
+        # the operator is commanding OPEN. Without this, the deceleration at the end
+        # of the opening stroke (high drive effort, falling speed) latch-chatters —
+        # observed live on gem10 right as a per-tick clog/unclog oscillation grinding
+        # the jaw 0.4 rad short of open, and it is what makes any widened
+        # clog_speed_threshold_scale unsafe. Normalized qpos convention: 0=closed,
+        # 1=open, so a close command means target < current.
+        closing_cmd = (
+            gripper_state["target_normalized_qpos"]
+            < gripper_state["current_normalized_qpos"] - 0.005
+        )
         if self._is_clogged:
             # SIMPLIFIED 2026-07-22 (round 2, per direct request): once latched,
             # freeze at the EXACT raw position where contact/overshoot was
@@ -573,7 +585,7 @@ class GripperForceLimiter:
                     "target=%.4f current=%.4f)",
                     self._name, normalized_target_qpos, normalized_current_qpos,
                 )
-        elif average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
+        elif closing_cmd and average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
             self._is_clogged = True
             self._just_latched = True
             logger.warning(
@@ -582,7 +594,7 @@ class GripperForceLimiter:
                 "for the fast-impact path.",
                 self._name, average_effort, self.clog_force_threshold, current_speed, self.clog_speed_threshold,
             )
-        elif hard_latch_effort > self.clog_force_threshold * self.hard_latch_effort_multiplier:
+        elif closing_cmd and hard_latch_effort > self.clog_force_threshold * self.hard_latch_effort_multiplier:
             # FIXED 2026-07-19: hard-impact override. The normal path above also
             # requires |current_speed| < clog_speed_threshold before latching --
             # fine after a SLOW approach (speed is already low), but after a FAST/
