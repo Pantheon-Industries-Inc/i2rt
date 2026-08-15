@@ -12,6 +12,8 @@ import numpy as np
 
 from i2rt.motor_drivers.dm_driver import DMChainCanInterface
 
+logger = logging.getLogger(__name__)
+
 I2RT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Arm XML paths
@@ -198,6 +200,7 @@ class GripperType(enum.Enum):
     CRANK_4310 = "crank_4310"  # a 4310 motor with a crank
     LINEAR_3507 = "linear_3507"  # a 3507 motor with a linear actuator
     LINEAR_4310 = "linear_4310"  # a 4310 motor with a linear actuator
+    LINEAR_4310_FAST = "linear_4310_fast"  # LINEAR_4310 worm gearbox swapped for a smaller-driven-gear (lower reduction, faster) variant -- 2026-07-16, gem1 left arm
 
     # technically not a gripper
     YAM_TEACHING_HANDLE = "yam_teaching_handle"
@@ -222,13 +225,17 @@ class GripperType(enum.Enum):
         return None
 
     def get_gripper_needs_calibration(self) -> bool:
-        return self in (GripperType.LINEAR_3507, GripperType.LINEAR_4310)
+        return self in (GripperType.LINEAR_3507, GripperType.LINEAR_4310, GripperType.LINEAR_4310_FAST)
 
     def get_xml_path(self) -> str:
         _xml_map = {
             GripperType.CRANK_4310: GRIPPER_CRANK_4310_PATH,
             GripperType.LINEAR_3507: GRIPPER_LINEAR_3507_PATH,
             GripperType.LINEAR_4310: GRIPPER_LINEAR_4310_PATH,
+            # same body/mesh as LINEAR_4310 -- only the internal worm gearbox ratio
+            # differs, which isn't represented in the mujoco model. Revisit if the
+            # new gearbox turns out to change external geometry too.
+            GripperType.LINEAR_4310_FAST: GRIPPER_LINEAR_4310_PATH,
             GripperType.YAM_TEACHING_HANDLE: GRIPPER_TEACHING_HANDLE_PATH,
             GripperType.NO_GRIPPER: GRIPPER_NO_GRIPPER_PATH,
         }
@@ -237,7 +244,7 @@ class GripperType(enum.Enum):
         return _xml_map[self]
 
     def get_motor_kp_kd(self) -> tuple[float, float]:
-        if self in (GripperType.CRANK_4310, GripperType.LINEAR_4310):
+        if self in (GripperType.CRANK_4310, GripperType.LINEAR_4310, GripperType.LINEAR_4310_FAST):
             return 20, 0.5
         elif self == GripperType.LINEAR_3507:
             return 10, 0.3
@@ -247,7 +254,7 @@ class GripperType(enum.Enum):
             raise ValueError(f"Unknown gripper type: {self}")
 
     def get_motor_type(self) -> str:
-        if self in (GripperType.CRANK_4310, GripperType.LINEAR_4310):
+        if self in (GripperType.CRANK_4310, GripperType.LINEAR_4310, GripperType.LINEAR_4310_FAST):
             return "DM4310"
         elif self == GripperType.LINEAR_3507:
             return "DM3507"
@@ -290,20 +297,40 @@ class GripperType(enum.Enum):
         elif self == GripperType.LINEAR_4310:
             return (
                 0.5,
-                # clog_speed_threshold: only treat the gripper as stalled when it
-                # is essentially stationary (<0.05 rad/s). The old 0.3 rad/s value
-                # misclassified deliberate SLOW closes (which run well under
-                # 0.3 rad/s) as stalls, so the force limiter would engage during
-                # travel and back-off/re-push in an audible limit-cycle ("grating"
-                # close). Telemetry showed every genuine clog occurs at |vel|~0
-                # (p90 < 0.02 rad/s), so 0.05 preserves stop/object force limiting
-                # and "let go on open" while eliminating travel grating.
-                0.05,
+                # clog_speed_threshold: bumped 0.05->0.08 (2026-07-15) -- real
+                # teleop is fast pull/release, rarely holds still enough to latch
+                # at 0.05. Old rationale: only treat as stalled when essentially
+                # stationary; the old 0.3 rad/s value misclassified deliberate SLOW
+                # closes as stalls, causing an audible limit-cycle ("grating")
+                # close. 0.08 stays well below that 0.3 problem value while giving
+                # fast real squeezes a realistic chance to latch on contact.
+                0.08,
                 1.0,
                 partial(
                     linear_gripper_force_torque_map,
                     motor_stroke=6.57,
                     gripper_stroke=0.096,
+                ),
+            )
+        elif self == GripperType.LINEAR_4310_FAST:
+            return (
+                0.75,  # RAISED from 0.5 (2026-07-22), per direct request -- grip harder before latching now that exact-position freeze (no backoff) makes the frozen hold safe to trust.
+                0.08,
+                1.0,
+                partial(
+                    linear_gripper_force_torque_map,
+                    # 2026-07-16: approximated from the measured gripper_open_span (left,
+                    # post-swap) via scripts/calibrate_gripper_open_span.py --side left --write
+                    # (close-stall +9.2262 -> chosen open +0.0288 -> span 9.197 rad). This is
+                    # motor-side rad from the close hardstop to an operator-chosen open point,
+                    # not a from-scratch full-mechanical-travel measurement the way the old
+                    # 6.57 constant nominally was -- so treat as a much better estimate, not a
+                    # ground truth. force = torque * motor_stroke / gripper_stroke: if this is
+                    # too large, required torque for a target force is understated (fails
+                    # weak/under-grips, not strong) -- re-tighten while re-tuning
+                    # limit_gripper_force under real load.
+                    motor_stroke=9.197,
+                    gripper_stroke=0.096,  # physical jaw travel (m) -- unchanged, same end effector
                 ),
             )
         elif self in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER):
@@ -451,8 +478,14 @@ class GripperForceLimiter:
         kp: float,
         average_torque_window: float = 0.1,  # in seconds
         debug: bool = False,
+        clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier -- see MotorChainRobot's clog_force_threshold_scale docstring.
+        clog_speed_threshold_scale: Optional[float] = None,  # ADDED 2026-08-15: per-rig multiplier on the soft-latch SPEED gate. The class default (0.08 rad/s for LINEAR_4310) is linear-drive tuning; a worm-gear jaw crushing a compliant object still creeps at 0.1-0.3 rad/s, so the soft latch never fires and force winds to the track-torque cap. Scale up so the latch can fire while the jaw is still creeping under load; keep the scaled value BELOW free-travel speed (gem10 right: ~0.55-0.65 rad/s) or it will false-latch mid-close.
+        name: Optional[str] = None,  # ADDED 2026-07-29: motor_chain_name (e.g. "yam_left"), used only to label clog log lines.
     ):
         self.max_force = max_force
+        self._name = name or "gripper"
+        self._clog_force_threshold_scale = clog_force_threshold_scale
+        self._clog_speed_threshold_scale = clog_speed_threshold_scale
         self.gripper_type = gripper_type
         self._is_clogged = False
         self._gripper_adjusted_qpos = None
@@ -460,15 +493,50 @@ class GripperForceLimiter:
         self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
         self.average_torque_window = average_torque_window
         self.debug = debug
+        # FIXED 2026-07-19: unlatch debounce. The raw unlatch check (average_effort <
+        # 0.2) could flip on a single noisy reading, causing _is_clogged to chatter
+        # on/off while genuinely stalled against an object -- observed via grip_diag.py
+        # as eff oscillating -1.09..+1.94 with the jaw not moving. Require the unlatch
+        # condition to hold continuously for _unlatch_debounce_s before actually
+        # unlatching; any violation resets the timer.
+        self._clog_unlatch_candidate_since = None
+        self._unlatch_debounce_s = 0.15
+        # ADDED 2026-07-22: unlatch-on-reopen deadband. The position half of
+        # unlatch_condition below (current more closed than target) used to
+        # fire on ANY positive gap, so ordinary leader-hand jitter while
+        # holding an object (bilateral kickback, tremor) nudged target_qpos
+        # open by a hair and, after _unlatch_debounce_s, fully released real
+        # grip force even though effort was still high. Require the gap to
+        # exceed this margin (normalized 0-1 qpos units) before it counts as
+        # "operator wants it open."
+        self._unlatch_open_deadband = 0.02
+        # FIXED 2026-07-19: hard-impact override multiplier -- see compute_target_gripper_torque.
+        self.hard_latch_effort_multiplier = 2.5  # REVERTED 2026-07-22 (was briefly 1.5) -- gripper_max_track_torque (per-arm YAML, always-on every tick, independent of clog detection) is now the real safety net and already confirmed catching fast pulls without breaking anything. The lowered multiplier here was over-sensitive and made LEFT false-latch (freeze, wont close) on an ordinary fast pull. Back to 2.5.
+        # RETUNED 2026-07-22 (round 2, per direct request): the hard-impact
+        # override briefly used raw instantaneous current_eff (single tick) to
+        # react faster to fast trigger pulls -- but a single tick is noisy
+        # (same noise this file elsewhere averages away, e.g. the unlatch
+        # debounce above) and was false-latching on noise spikes at the start
+        # of a fast pull, with nothing actually gripped -- observed live as
+        # "pull trigger, nothing happens" (can't unlatch via a close command,
+        # only via a deliberate open). Average over a SHORT window instead --
+        # enough ticks to reject single-sample noise, far shorter than the
+        # main average_torque_window so it still reacts well before a slow
+        # approach would.
+        self.hard_latch_window_s = 0.03
         (self.clog_force_threshold, self.clog_speed_threshold, self.sign, _gripper_force_torque_map) = (
             self.gripper_type.get_gripper_limiter_params()
         )
+        if self._clog_force_threshold_scale is not None:
+            self.clog_force_threshold *= self._clog_force_threshold_scale
+        if self._clog_speed_threshold_scale is not None:
+            self.clog_speed_threshold *= self._clog_speed_threshold_scale
         self.gripper_force_torque_map = partial(
             _gripper_force_torque_map,
             gripper_force=self.max_force,
         )
 
-    def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> float:
+    def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> bool:
         current_speed = gripper_state["current_qvel"]
         relevant_history_effort = self._past_gripper_effort_buffer.get_recent_values(self.average_torque_window)
         if len(relevant_history_effort) > 0:
@@ -479,50 +547,181 @@ class GripperForceLimiter:
         if self.debug:
             print(f"average_effort: {average_effort}")
 
+        relevant_history_effort_short = self._past_gripper_effort_buffer.get_recent_values(self.hard_latch_window_s)
+        if len(relevant_history_effort_short) > 0:
+            hard_latch_effort = np.abs(np.mean(relevant_history_effort_short))
+        else:
+            hard_latch_effort = np.abs(gripper_state["current_eff"])
+
+        self._just_latched = False
         if self._is_clogged:
+            # SIMPLIFIED 2026-07-22 (round 2, per direct request): once latched,
+            # freeze at the EXACT raw position where contact/overshoot was
+            # detected -- no force-model extrapolation (round 1 computed a
+            # position from gripper_force_torque_map/limit_gripper_force, which
+            # could back the jaw OFF the true overshoot point to match that
+            # model -- that backing-off was the remaining "drift backwards").
+            # Only release on a real, deliberate open command from the leader.
             normalized_current_qpos = gripper_state["current_normalized_qpos"]
             normalized_target_qpos = gripper_state["target_normalized_qpos"]
             # 0 close 1 open
-            if (normalized_current_qpos < normalized_target_qpos) or average_effort < 0.2:  # want to open
+            if normalized_target_qpos > normalized_current_qpos + self._unlatch_open_deadband:
                 self._is_clogged = False
+                self._gripper_adjusted_qpos = None  # recompute fresh next time it latches
+                logger.info(
+                    "%s: gripper clog latch RELEASED (operator opened past deadband, "
+                    "target=%.4f current=%.4f)",
+                    self._name, normalized_target_qpos, normalized_current_qpos,
+                )
         elif average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
             self._is_clogged = True
-
-        if self._is_clogged:
-            target_eff = self.gripper_force_torque_map(current_angle=gripper_state["current_qpos"])
+            self._just_latched = True
+            logger.warning(
+                "%s: gripper CLOG detected (soft latch) — avg_effort=%.3f Nm > threshold=%.3f Nm "
+                "while speed=%.4f rad/s < %.4f rad/s. Freezing position; see hard_latch_effort_multiplier "
+                "for the fast-impact path.",
+                self._name, average_effort, self.clog_force_threshold, current_speed, self.clog_speed_threshold,
+            )
+        elif hard_latch_effort > self.clog_force_threshold * self.hard_latch_effort_multiplier:
+            # FIXED 2026-07-19: hard-impact override. The normal path above also
+            # requires |current_speed| < clog_speed_threshold before latching --
+            # fine after a SLOW approach (speed is already low), but after a FAST/
+            # high-momentum impact, measured speed doesn't settle near-zero
+            # instantly (bounce/ringing/sensor lag), so the latch (and therefore
+            # any velocity-feedforward cutoff gated on it) can lag a hard fast
+            # impact -- observed live as the gripper "ignoring force constraints"
+            # on a fast trigger pull. This path latches immediately on
+            # unambiguously-high effort alone, with no speed gate, closing that
+            # race regardless of how fast the approach was.
+            # RETUNED 2026-07-22: uses hard_latch_effort (short-window average,
+            # see hard_latch_window_s) rather than raw instantaneous current_eff
+            # -- a single tick was too noisy and false-latched on nothing.
             self._is_clogged = True
-            return target_eff + 0.3  # this is to compensate the friction
-        else:
-            return None
+            self._just_latched = True
+            logger.warning(
+                "%s: gripper CLOG detected (hard-impact latch) — hard_latch_effort=%.3f Nm > "
+                "threshold=%.3f Nm (%.1fx soft threshold). Freezing position.",
+                self._name, hard_latch_effort, self.clog_force_threshold * self.hard_latch_effort_multiplier,
+                self.hard_latch_effort_multiplier,
+            )
+
+        return self._is_clogged
 
     def update(self, gripper_state: Dict[str, float]) -> None:
         current_ts = time.time()
         self._past_gripper_effort_buffer.put(current_ts, gripper_state["current_eff"])
-        target_eff = self.compute_target_gripper_torque(gripper_state)
+        is_clogged = self.compute_target_gripper_torque(gripper_state)
 
-        if target_eff is not None:
-            command_sign = np.sign(gripper_state["target_qpos"] - gripper_state["current_qpos"]) * self.sign
-            current_zero_eff_pos = (
-                gripper_state["last_command_qpos"] - command_sign * np.abs(gripper_state["current_eff"]) / self._kp
-            )
-            target_gripper_raw_pos = current_zero_eff_pos + command_sign * np.abs(target_eff) / self._kp
-            if self.debug:
-                print("clogged")
-                print(f"gripper_state: {gripper_state}")
-                print("current zero eff")
-                print(current_zero_eff_pos)
-                print(f"target_gripper_raw_pos: {target_gripper_raw_pos}")
-            # Update gripper target position
-            a = 0.1
-            if self._gripper_adjusted_qpos is None:  # initialize it to the target position
-                self._gripper_adjusted_qpos = target_gripper_raw_pos
-            self._gripper_adjusted_qpos = (1 - a) * self._gripper_adjusted_qpos + a * target_gripper_raw_pos
+        if is_clogged:
+            if self._just_latched or self._gripper_adjusted_qpos is None:
+                # RETUNED 2026-07-22 (round 4, per direct request): round 3's
+                # one-way rule (only push further closed, never back off) meant
+                # a hard/fast impact (typically a bigger, more rigid object) kept
+                # WHATEVER overshoot it built up with no ceiling, while a gentle
+                # slow contact (typically a smaller object) got capped down to
+                # the moderate target_eff baseline -- backwards from "consistent,
+                # not stronger on big objects." Fix: snap to the angle-normalized
+                # target_eff position in EITHER direction, but do it ONCE, right
+                # here, then freeze permanently (see the `elif self._is_clogged`
+                # branch below -- no further recompute ever). That one-time snap
+                # is NOT the old "settle-then-ease-back" bug -- that was a
+                # continuous multi-tick re-tracking loop from live noisy effort,
+                # visibly drifting over time. This resolves within one tick and
+                # never touches the position again.
+                current_eff = gripper_state["current_eff"]
+                target_eff = self.gripper_force_torque_map(current_angle=gripper_state["current_qpos"]) + 0.3
+                command_sign = np.sign(gripper_state["target_qpos"] - gripper_state["current_qpos"]) * self.sign
+                current_zero_eff_pos = (
+                    gripper_state["last_command_qpos"] - command_sign * np.abs(current_eff) / self._kp
+                )
+                self._gripper_adjusted_qpos = current_zero_eff_pos + command_sign * np.abs(target_eff) / self._kp
+                if self.debug:
+                    print(f"clogged (latching): current_eff={current_eff} target_eff={target_eff} adj={self._gripper_adjusted_qpos}")
+            elif self.debug:
+                print("clogged (holding)", self._gripper_adjusted_qpos)
             return self._gripper_adjusted_qpos
         else:
             if self.debug:
                 print("unclogged")
             self._gripper_adjusted_qpos = gripper_state["current_qpos"]
             return gripper_state["target_qpos"]
+
+def rezero_gripper_midstroke(
+    motor_chain: DMChainCanInterface,
+    gripper_index: int = 6,
+    test_torque: float = 1.0,
+    open_span: float = 14.0,
+    position_threshold: float = 0.005,
+    check_interval: float = 0.05,
+    max_duration: float = 30.0,
+) -> List[float]:
+    """Anchor the gripper's operating window mid-stroke so position commands
+    always fit the ±12.5 rad p16 encoding.
+
+    The DM4310's multi-turn zero drifts across power cycles; on boots where the
+    close stop lands beyond ±12.5 rad absolute, position commands get silently
+    clamped at the wire and the gripper parks short (verified via grip_diag).
+    Sequence: stall-probe closed (torque, gentle) -> torque-drive open by
+    span/2 (position-monitored from the verified stall, aborts on early jam so
+    it can NEVER over-open) -> save current position as the motor's zero ->
+    limits become [+span/2, -span/2].
+
+    Returns [closed, open] in the new zeroed frame.
+    """
+    logger = logging.getLogger(__name__)
+    closed_abs = detect_gripper_limits(
+        motor_chain, gripper_index, test_torque, max_duration,
+        position_threshold, check_interval, open_span=0.0,
+    )[0]
+    motor_direction = motor_chain.motor_direction[gripper_index]
+    close_dir = 1 if motor_direction > 0 else -1
+    num = len(motor_chain.motor_list)
+    half = abs(open_span) / 2.0
+
+    logger.info(f"Rezero: close stall at {closed_abs:.3f}, driving open {half:.2f} rad to mid-stroke...")
+    torques = np.zeros(num)
+    torques[gripper_index] = -close_dir * test_torque
+    start = time.time()
+    last_pos, stable = None, 0
+    while True:
+        if time.time() - start > max_duration:
+            motor_chain.set_commands(torques=np.zeros(num))
+            raise RuntimeError("gripper mid-stroke drive timed out")
+        motor_chain.set_commands(torques=torques)
+        time.sleep(check_interval)
+        pos = motor_chain.read_states()[gripper_index].pos
+        if abs(pos - closed_abs) >= half:
+            break
+        if last_pos is not None and abs(pos - last_pos) < position_threshold:
+            stable += 1
+            if stable >= 80:  # bumped from 20 (2026-07-15): 1s was too impatient, false-tripping on worm-gear static-friction catch points that manual jogging worked through fine on this exact mechanism. ~4s at check_interval=0.05s.
+                motor_chain.set_commands(torques=np.zeros(num))
+                raise RuntimeError(
+                    f"gripper stalled while opening to mid-stroke at "
+                    f"{abs(pos - closed_abs):.2f}/{half:.2f} rad — check the mechanism / open_span"
+                )
+        else:
+            stable = 0
+        last_pos = pos
+
+    motor_chain.set_commands(torques=np.zeros(num))
+    time.sleep(0.3)
+
+    # Direct bus transaction: stop the chain thread first so frames don't race.
+    motor_chain.running = False
+    time.sleep(0.2)
+    motor_id = motor_chain.motor_list[gripper_index][0]
+    motor_chain.motor_interface.save_zero_position(motor_id)
+    time.sleep(0.2)
+    if motor_chain.absolute_positions is not None:
+        motor_chain.absolute_positions[gripper_index] = 0.0
+    motor_chain.start_thread()
+    time.sleep(0.2)
+
+    closed = close_dir * half
+    opened = -close_dir * half
+    logger.info(f"Rezero done: gripper zeroed mid-stroke, limits [{closed:.2f}, {opened:.2f}]")
+    return [closed, opened]
 
 
 def detect_gripper_limits(
@@ -532,6 +731,7 @@ def detect_gripper_limits(
     max_duration: float = 2.0,
     position_threshold: float = 0.01,
     check_interval: float = 0.1,
+    open_span: Optional[float] = None,
 ) -> List[float]:
     """
     Detect gripper limits by applying test torques and monitoring position changes.
@@ -543,9 +743,15 @@ def detect_gripper_limits(
         max_duration: Maximum test duration for each direction (s)
         position_threshold: Minimum position change to consider motor still moving (rad)
         check_interval: Time interval between checks (s)
+        open_span: If set, the gripper has NO mechanical hardstop on the open side
+            (e.g. damiao DM4310 on the worm-gear end effector) so only the CLOSE
+            direction is stall-probed; 'open' is defined as closed minus this many
+            rad of travel. Still immune to multi-turn zero shifts since it re-anchors
+            on the close stall every boot. Find the value with
+            scripts/calibrate_gripper_open_span.py.
 
     Returns:
-        List of detected limits [limit1, limit2]
+        List of detected limits [closed, open]
     """
     logger = logging.getLogger(__name__)
     positions = []
@@ -562,8 +768,13 @@ def detect_gripper_limits(
     positions.append(initial_pos)
     logger.info(f"Gripper calibration starting from position: {initial_pos:.4f}")
 
-    # Test both directions
-    for direction in [1, -1]:
+    # Close direction in the raw motor frame: with motor_direction > 0 the
+    # 'closed' limit is the max position (see ordering below), i.e. +torque.
+    close_direction = 1 if motor_direction > 0 else -1
+
+    # Test both directions — or close-only when open has no hardstop
+    directions = [close_direction] if open_span is not None else [1, -1]
+    for direction in directions:
         logger.info(f"Testing gripper direction: {direction}")
         test_torques = init_torque
         test_torques[gripper_index] = direction * test_torque
@@ -589,13 +800,23 @@ def detect_gripper_limits(
                     position_stable_count = 0
 
                 # Check if gripper has hit limit (position stable)
-                if position_stable_count >= 3:
+                if position_stable_count >= 60:  # bumped from 3 (2026-07-15): ~150ms was far too impatient, false-tripping the CLOSE-direction stall probe on the same static-friction catch points as the open-direction issue, landing the whole calibrated range short of the true closed position
                     logger.info(f"Gripper limit detected: pos={current_pos:.4f}")
                     break
 
             last_pos = current_pos
 
         time.sleep(0.3)
+
+    if open_span is not None:
+        # Closed = where the close-direction probe stalled; open is software-defined
+        # at open_span rad of travel back from closed (no hardstop to probe).
+        closed = positions[-1]
+        opened = closed - close_direction * abs(open_span)
+        logger.info(
+            f"Gripper close stall at {closed:.4f}, software open limit (span {open_span}): {opened:.4f}"
+        )
+        return [closed, opened]
 
     # Calculate detected limits
     min_pos = min(positions)

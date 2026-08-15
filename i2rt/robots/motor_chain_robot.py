@@ -14,7 +14,13 @@ from i2rt.motor_drivers.dm_driver import (
     PassiveEncoderInfo,
 )
 from i2rt.robots.robot import Robot
-from i2rt.robots.utils import GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
+from i2rt.robots.utils import (
+    GripperForceLimiter,
+    GripperType,
+    JointMapper,
+    detect_gripper_limits,
+    rezero_gripper_midstroke,
+)
 from i2rt.utils.mujoco_utils import MuJoCoKDL
 
 
@@ -86,6 +92,14 @@ class MotorChainRobot(Robot):
         position_threshold: float = 0.01,  # minimum position change to consider motor still moving (rad)
         check_interval: float = 0.05,  # time interval between checks (s)
         gripper_close_margin: float = 0.0,  # push detected 'closed' deeper (rad) so the jaw fully seats
+        gripper_open_span: Optional[float] = None,  # no open hardstop (worm-gear damiao): probe close stall only, open = closed - span (rad)
+        gripper_max_track_torque: Optional[float] = None,  # hard cap (Nm) on gripper tracking torque: clamps cmd pos within tau/kp of current pos EVERY tick (force limiter only engages at stall)
+        gripper_effort_window: float = 0.1,  # force-limiter effort averaging window (s); longer = slower clog latch/unlatch, steadier hold on slow worm-gear grippers
+        gripper_torque_mode: bool = False,  # drive the gripper with torque cmds via a software position loop instead of onboard MIT position control. REQUIRED when the gripper's absolute position can exceed the ±12.5 rad p16 command encoding (long-stroke worm gear + multi-turn zero drift): position cmds get silently clamped at ±12.5, torque cmds don't.
+        gripper_torque_mode_cap: float = 2.0,  # torque clip (Nm) for the software gripper loop
+        gripper_rezero_midstroke: bool = False,  # boot: stall-probe closed, drive open span/2, save that as the motor's zero -> limits [+span/2, -span/2] always fit the ±12.5 p16 encoding regardless of multi-turn drift. Plain position control thereafter.
+        clog_speed_threshold_scale: Optional[float] = None,  # ADDED 2026-08-15: per-rig multiplier on the soft-latch speed gate -- see GripperForceLimiter. Worm-gear rigs need >1 or the latch never fires on compliant objects.
+        clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier on GripperType's shared clog_force_threshold/hard_latch trigger -- different physical grippers of the same nominal type can have different baseline mechanical friction, so free-space closing motion alone can cross the shared class-level threshold on one rig before it would on another (false "clogged" latch with nothing actually gripped, closing stops short). None = use the class default unscaled.
 
         pinned_cpu: int | None = None,
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
@@ -109,15 +123,29 @@ class MotorChainRobot(Robot):
             )
             if gripper_limits is None and enable_gripper_calibration:
                 logger = logging.getLogger(__name__)
-                logger.info("Auto-detecting gripper limits...")
-                detected_limits = detect_gripper_limits(
-                    motor_chain=motor_chain,
-                    gripper_index=gripper_index,
-                    test_torque=test_torque,
-                    max_duration=test_duration,
-                    position_threshold=position_threshold,
-                    check_interval=check_interval,
-                )
+                if gripper_rezero_midstroke:
+                    assert gripper_open_span, "gripper_rezero_midstroke requires gripper_open_span"
+                    logger.info("Calibrating gripper via mid-stroke rezero...")
+                    detected_limits = rezero_gripper_midstroke(
+                        motor_chain=motor_chain,
+                        gripper_index=gripper_index,
+                        test_torque=test_torque,
+                        open_span=gripper_open_span,
+                        position_threshold=position_threshold,
+                        check_interval=check_interval,
+                        max_duration=test_duration,
+                    )
+                else:
+                    logger.info("Auto-detecting gripper limits...")
+                    detected_limits = detect_gripper_limits(
+                        motor_chain=motor_chain,
+                        gripper_index=gripper_index,
+                        test_torque=test_torque,
+                        max_duration=test_duration,
+                        position_threshold=position_threshold,
+                        check_interval=check_interval,
+                        open_span=gripper_open_span,
+                    )
                 gripper_limits = np.array(detected_limits)
                 logger.info(f"Gripper limits auto-detected: {gripper_limits}")
             elif gripper_limits is None:
@@ -169,12 +197,26 @@ class MotorChainRobot(Robot):
 
         # variables for gripper effort limiting
         self._gripper_index = gripper_index
+        self._gripper_max_track_torque = gripper_max_track_torque
+        self._gripper_torque_mode = gripper_torque_mode
+        self._gripper_torque_mode_cap = gripper_torque_mode_cap
         self.remapper = JointMapper({}, len(motor_chain))  # so it works without gripper
         self._gripper_limits = gripper_limits
 
         if self._gripper_index is not None:
+            self._chain_name = (
+                getattr(motor_chain, "motor_chain_name", None)
+                or getattr(motor_chain, "channel", None)
+                or getattr(motor_chain, "name", None)
+            )
             self._gripper_force_limiter = GripperForceLimiter(
-                max_force=limit_gripper_force, gripper_type=gripper_type, kp=kp[gripper_index]
+                max_force=limit_gripper_force,
+                gripper_type=gripper_type,
+                kp=kp[gripper_index],
+                average_torque_window=gripper_effort_window,
+                clog_force_threshold_scale=clog_force_threshold_scale,
+                clog_speed_threshold_scale=clog_speed_threshold_scale,
+                name=self._chain_name,
             )  # force in newton
             self._limit_gripper_force = limit_gripper_force
 
@@ -386,6 +428,7 @@ class MotorChainRobot(Robot):
             motor_torques = np.clip(motor_torques, -self._clip_motor_torque, self._clip_motor_torque)
 
             if self._gripper_index is not None:
+                _dbg_raw_target = float(joint_commands.pos[self._gripper_index])
                 if self._limit_gripper_force > 0 and self._joint_state is not None:
                     # Get current gripper state in raw robot joint pos space
                     gripper_state = {
@@ -406,6 +449,19 @@ class MotorChainRobot(Robot):
                     joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
                     self._grip_trace(gripper_state, _pre, float(joint_commands.pos[self._gripper_index]))
 
+                # Hard tracking-torque cap: onboard torque = kp*(cmd - pos), so
+                # clamp cmd within tau/kp of the current pos every tick. Unlike
+                # the force limiter (stall-only), this bounds torque in free
+                # travel too — the gripper can never be driven harder than this.
+                if self._gripper_max_track_torque is not None and self._joint_state is not None:
+                    _kp_g = float(self._kp[self._gripper_index])
+                    if _kp_g > 0:
+                        _max_err = self._gripper_max_track_torque / _kp_g
+                        _cur = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[self._gripper_index]
+                        joint_commands.pos[self._gripper_index] = np.clip(
+                            joint_commands.pos[self._gripper_index], _cur - _max_err, _cur + _max_err
+                        )
+
                 # add final clip so the gripper won't be over-adjusted
                 joint_commands.pos[self._gripper_index] = np.clip(
                     joint_commands.pos[self._gripper_index],
@@ -413,6 +469,131 @@ class MotorChainRobot(Robot):
                     max(self._gripper_limits),
                 )
                 self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
+
+                # --- Gripper velocity feedforward (opt-in: GRIP_VEL_FF=<cap rad/s>) ---
+                # v_des=0 makes the DM4310 kd term a brake (kd*(0 - v)); feeding a
+                # velocity in the COMMAND direction turns kd into a driver, so the jaw
+                # travels faster WITHOUT raising kp or stall force. Capped low and cut
+                # out near contact/stall (see cutout below) and tapered over the
+                # final approach so it can never slam the worm gear into the stop.
+                # Off entirely unless GRIP_VEL_FF is set in the environment.
+                if not hasattr(self, "_vff_cap"):
+                    import os as _vff_os
+                    try:
+                        self._vff_cap = float(_vff_os.environ.get("GRIP_VEL_FF", "0") or 0)
+                    except ValueError:
+                        self._vff_cap = 0.0
+                    self._vff_deadband = 0.1   # rad: no FF once within this of target (was 0.3, shrunk 2026-07-19 for speed -- last stretch is pure kp tracking, disproportionately slow relative to distance)
+                    self._vff_taper = 0.4      # rad: linearly ramp FF over the last this-much (was 1.0, shrunk 2026-07-19 to match)
+                    self._vff_stall_speed = 0.15  # rad/s: ADDED 2026-07-29. When the force limiter is bypassed (limit_gripper_force<=0), the jaw counts as stalled-on-contact once speed drops below this WITH the track-torque clamp saturated -> FF cut so kd*vff can't add torque past gripper_max_track_torque. Free travel is faster than this, so FF stays on there.
+                self._dbg_vff = 0.0
+                if self._vff_cap > 0 and self._joint_state is not None:
+                    _vff_cur = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[self._gripper_index]
+                    # FIXED 2026-07-19: was joint_commands.pos[...] here, which by this
+                    # point has already been squeezed to within
+                    # gripper_max_track_torque/kp (~0.33 rad) of actual by the
+                    # position-clamp above -- starving this error input so the
+                    # deadband/taper ramp (0.3-1.0 rad) never saw enough distance to
+                    # reach anywhere near _vff_cap, capping effective speed around
+                    # ~vff_cap*0.33 regardless of how far the true target was.
+                    # Use the true raw (pre-clamp) target instead so the taper reflects
+                    # genuine remaining distance; the hard-latch + clog cutout below
+                    # still bounds actual contact force independent of this.
+                    _vff_err = _dbg_raw_target - _vff_cur
+                    # Contact/stall cutout -- kill FF so the kd*(vff - vel) term can
+                    # never add torque past the force ceiling on contact. Two regimes:
+                    #  - force limiter active (limit_gripper_force > 0): use its clog flag.
+                    #  - force limiter bypassed (<= 0, gem10 worm grippers): derive the
+                    #    equivalent from the track-torque cap -- the clamp is saturated
+                    #    (raw target pulls past cap/kp of travel) AND the jaw has stalled
+                    #    (speed < _vff_stall_speed) => pushing on something at the torque
+                    #    ceiling. During fast free travel the clamp is also saturated but
+                    #    speed is high, so FF stays on there. Without this, a stalled jaw
+                    #    (vel~0) leaves kd*(vff-vel)=kd*vff added on top of the cap.
+                    if self._limit_gripper_force > 0:
+                        _vff_clog = bool(getattr(self._gripper_force_limiter, "_is_clogged", False))
+                    elif self._gripper_max_track_torque is not None:
+                        _kp_g_vff = float(self._kp[self._gripper_index])
+                        _vff_sat = _kp_g_vff > 0 and abs(_vff_err) > (self._gripper_max_track_torque / _kp_g_vff)
+                        _vff_slow = abs(float(self._joint_state.vel[self._gripper_index])) < self._vff_stall_speed
+                        _vff_clog = bool(_vff_sat and _vff_slow)
+                    else:
+                        _vff_clog = False
+                    if (not _vff_clog) and abs(_vff_err) > self._vff_deadband:
+                        _vff = np.sign(_vff_err) * self._vff_cap * min(1.0, abs(_vff_err) / self._vff_taper)
+                        joint_commands.vel[self._gripper_index] = float(_vff)
+                        self._dbg_vff = float(_vff)
+                    else:
+                        joint_commands.vel[self._gripper_index] = 0.0
+
+                # Env-gated live print of the gripper's applied torque (opt-in:
+                # GRIP_TORQUE_PRINT=<interval_s>, e.g. "0.1"; any non-numeric truthy
+                # value, e.g. "1", defaults to a 0.2s cadence; unset/"" = off).
+                # REPLACES a prior unconditional "TEMP DEBUG" print (2026-07-15) that
+                # ran every 0.3s regardless of env, spamming stdout in every session.
+                # "applied" is the motor's OWN measured effort (current_eff) -- the
+                # real torque it's exerting right now, as read back from the drive --
+                # vs "cmd_torque", the torque the onboard PD loop is about to command
+                # given the final (post force-limiter/track-torque-cap/limits-clip)
+                # position target: kp*(final_cmd - current). Comparing the two shows
+                # whether the position loop is actually achieving its computed torque
+                # or the gripper is stuck (applied plateaus while cmd keeps climbing).
+                if not hasattr(self, "_grip_torque_print_interval"):
+                    import os as _gtp_os
+                    _gtp_raw = _gtp_os.environ.get("GRIP_TORQUE_PRINT", "")
+                    if _gtp_raw:
+                        try:
+                            self._grip_torque_print_interval = max(0.0, float(_gtp_raw))
+                        except ValueError:
+                            self._grip_torque_print_interval = 0.2
+                    else:
+                        self._grip_torque_print_interval = None  # disabled
+                if self._grip_torque_print_interval is not None:
+                    _gtp_now = time.time()
+                    if (
+                        not hasattr(self, "_grip_torque_last_print")
+                        or _gtp_now - self._grip_torque_last_print >= self._grip_torque_print_interval
+                    ):
+                        self._grip_torque_last_print = _gtp_now
+                        _gtp_cur = float(
+                            self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[self._gripper_index]
+                        )
+                        _gtp_final_cmd = float(joint_commands.pos[self._gripper_index])
+                        _gtp_kp = float(self._kp[self._gripper_index])
+                        _gtp_cmd_torque = _gtp_kp * (_gtp_final_cmd - _gtp_cur)
+                        _gtp_applied = float(self._joint_state.eff[self._gripper_index])
+                        _gtp_clogged = bool(getattr(self._gripper_force_limiter, "_is_clogged", False))
+                        print(
+                            f"[GRIP_TORQUE {getattr(self, '_chain_name', None) or 'gripper'}] "
+                            f"applied={_gtp_applied:+.3f} Nm cmd_torque={_gtp_cmd_torque:+.3f} Nm "
+                            f"cap={self._gripper_max_track_torque} raw_target={_dbg_raw_target:.3f} "
+                            f"final_cmd={_gtp_final_cmd:.3f} current={_gtp_cur:.3f} "
+                            f"vff={getattr(self, '_dbg_vff', 0.0):.3f} clogged={_gtp_clogged}",
+                            flush=True,
+                        )
+
+                # Torque mode: run the position loop HERE (wrap-aware absolute
+                # positions) and send pure torque. Onboard position control is
+                # useless past ±12.5 rad — the p16 encoding clamps the command,
+                # the motor thinks it's on target, and the jaw parks (found via
+                # grip_diag: closed at +18.7 abs, cmd clamped to 12.5, eff ~0).
+                if self._gripper_torque_mode and self._joint_state is not None:
+                    _g = self._gripper_index
+                    _cur = self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[_g]
+                    _vel = self._joint_state.vel[_g]
+                    _err = joint_commands.pos[_g] - _cur
+                    _tau = float(
+                        np.clip(
+                            self._kp[_g] * _err - self._kd[_g] * _vel,
+                            -self._gripper_torque_mode_cap,
+                            self._gripper_torque_mode_cap,
+                        )
+                    )
+                    motor_torques[_g] += _tau
+                    joint_commands.pos[_g] = 0.0
+                    joint_commands.vel[_g] = 0.0
+                    joint_commands.kp[_g] = 0.0
+                    joint_commands.kd[_g] = 0.0
             if not self.motor_chain.start_thread_flag:
                 self.motor_chain.set_commands(
                     motor_torques,
