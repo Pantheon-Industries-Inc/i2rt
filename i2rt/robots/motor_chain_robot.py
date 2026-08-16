@@ -99,7 +99,8 @@ class MotorChainRobot(Robot):
         gripper_torque_mode_cap: float = 2.0,  # torque clip (Nm) for the software gripper loop
         gripper_rezero_midstroke: bool = False,  # boot: stall-probe closed, drive open span/2, save that as the motor's zero -> limits [+span/2, -span/2] always fit the ±12.5 p16 encoding regardless of multi-turn drift. Plain position control thereafter.
         clog_speed_threshold_scale: Optional[float] = None,
-        hard_latch_effort_multiplier: Optional[float] = None,  # per-rig hard-latch trip point as a multiple of the scaled soft threshold (default 2.5) -- see GripperForceLimiter  # ADDED 2026-08-15: per-rig multiplier on the soft-latch speed gate -- see GripperForceLimiter. Worm-gear rigs need >1 or the latch never fires on compliant objects.
+        hard_latch_effort_multiplier: Optional[float] = None,
+        clog_grace_s: float = 0.0,  # latch suppression window at close-stroke onset -- see GripperForceLimiter  # per-rig hard-latch trip point as a multiple of the scaled soft threshold (default 2.5) -- see GripperForceLimiter  # ADDED 2026-08-15: per-rig multiplier on the soft-latch speed gate -- see GripperForceLimiter. Worm-gear rigs need >1 or the latch never fires on compliant objects.
         clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier on GripperType's shared clog_force_threshold/hard_latch trigger -- different physical grippers of the same nominal type can have different baseline mechanical friction, so free-space closing motion alone can cross the shared class-level threshold on one rig before it would on another (false "clogged" latch with nothing actually gripped, closing stops short). None = use the class default unscaled.
 
         pinned_cpu: int | None = None,
@@ -218,6 +219,7 @@ class MotorChainRobot(Robot):
                 clog_force_threshold_scale=clog_force_threshold_scale,
                 clog_speed_threshold_scale=clog_speed_threshold_scale,
                 hard_latch_effort_multiplier=hard_latch_effort_multiplier,
+                clog_grace_s=clog_grace_s,
                 name=self._chain_name,
             )  # force in newton
             self._limit_gripper_force = limit_gripper_force

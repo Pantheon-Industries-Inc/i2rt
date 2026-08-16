@@ -480,13 +480,16 @@ class GripperForceLimiter:
         debug: bool = False,
         clog_force_threshold_scale: Optional[float] = None,  # ADDED 2026-07-22: per-rig multiplier -- see MotorChainRobot's clog_force_threshold_scale docstring.
         clog_speed_threshold_scale: Optional[float] = None,
-        hard_latch_effort_multiplier: Optional[float] = None,  # ADDED 2026-08-15: override the hard-latch trip point as a multiple of the (scaled) soft threshold. Default 2.5.  # ADDED 2026-08-15: per-rig multiplier on the soft-latch SPEED gate. The class default (0.08 rad/s for LINEAR_4310) is linear-drive tuning; a worm-gear jaw crushing a compliant object still creeps at 0.1-0.3 rad/s, so the soft latch never fires and force winds to the track-torque cap. Scale up so the latch can fire while the jaw is still creeping under load; keep the scaled value BELOW free-travel speed (gem10 right: ~0.55-0.65 rad/s) or it will false-latch mid-close.
+        hard_latch_effort_multiplier: Optional[float] = None,
+        clog_grace_s: float = 0.0,  # ADDED 2026-08-15: suppress BOTH latch paths for this long after a close stroke begins (command flips close-ward). Measured effort conflates contact force with reversal torque (breakaway + backlash + kd fighting the still-opening jaw), and that transient lands exactly at low velocity = indistinguishable from contact. A quick release->re-pull was false-latching into the stall state. During the window force is still bounded by gripper_max_track_torque; a real grab latches the moment the window expires. 0.0 = off (stock behavior).  # ADDED 2026-08-15: override the hard-latch trip point as a multiple of the (scaled) soft threshold. Default 2.5.  # ADDED 2026-08-15: per-rig multiplier on the soft-latch SPEED gate. The class default (0.08 rad/s for LINEAR_4310) is linear-drive tuning; a worm-gear jaw crushing a compliant object still creeps at 0.1-0.3 rad/s, so the soft latch never fires and force winds to the track-torque cap. Scale up so the latch can fire while the jaw is still creeping under load; keep the scaled value BELOW free-travel speed (gem10 right: ~0.55-0.65 rad/s) or it will false-latch mid-close.
         name: Optional[str] = None,  # ADDED 2026-07-29: motor_chain_name (e.g. "yam_left"), used only to label clog log lines.
     ):
         self.max_force = max_force
         self._name = name or "gripper"
         self._clog_force_threshold_scale = clog_force_threshold_scale
         self._clog_speed_threshold_scale = clog_speed_threshold_scale
+        self._clog_grace_s = float(clog_grace_s)
+        self._close_cmd_since = None  # wall time the current close stroke began; None while not closing
         self.gripper_type = gripper_type
         self._is_clogged = False
         self._gripper_adjusted_qpos = None
@@ -567,6 +570,19 @@ class GripperForceLimiter:
             gripper_state["target_normalized_qpos"]
             < gripper_state["current_normalized_qpos"] - 0.005
         )
+        # Latch grace window: (re)arm the clock at every close-stroke onset; while
+        # inside the window, reversal/breakaway transients cannot latch (see
+        # clog_grace_s in __init__).
+        now_ts = time.time()
+        if not closing_cmd:
+            self._close_cmd_since = None
+        elif self._close_cmd_since is None:
+            self._close_cmd_since = now_ts
+        in_grace = (
+            self._clog_grace_s > 0.0
+            and self._close_cmd_since is not None
+            and (now_ts - self._close_cmd_since) < self._clog_grace_s
+        )
         if self._is_clogged:
             # SIMPLIFIED 2026-07-22 (round 2, per direct request): once latched,
             # freeze at the EXACT raw position where contact/overshoot was
@@ -586,7 +602,7 @@ class GripperForceLimiter:
                     "target=%.4f current=%.4f)",
                     self._name, normalized_target_qpos, normalized_current_qpos,
                 )
-        elif closing_cmd and average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
+        elif closing_cmd and not in_grace and average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
             self._is_clogged = True
             self._just_latched = True
             logger.warning(
@@ -595,7 +611,7 @@ class GripperForceLimiter:
                 "for the fast-impact path.",
                 self._name, average_effort, self.clog_force_threshold, current_speed, self.clog_speed_threshold,
             )
-        elif closing_cmd and hard_latch_effort > self.clog_force_threshold * self.hard_latch_effort_multiplier:
+        elif closing_cmd and not in_grace and hard_latch_effort > self.clog_force_threshold * self.hard_latch_effort_multiplier:
             # FIXED 2026-07-19: hard-impact override. The normal path above also
             # requires |current_speed| < clog_speed_threshold before latching --
             # fine after a SLOW approach (speed is already low), but after a FAST/
